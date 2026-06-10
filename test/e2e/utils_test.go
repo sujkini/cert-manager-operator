@@ -6,14 +6,17 @@ package e2e
 import (
 	"bytes"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +26,8 @@ import (
 	certmanagerclientset "github.com/cert-manager/cert-manager/pkg/client/clientset/versioned"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
 	opv1 "github.com/openshift/api/operator/v1"
 	configv1 "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
 	operatorv1 "github.com/openshift/client-go/operator/clientset/versioned/typed/operator/v1"
@@ -366,6 +371,48 @@ func verifyDeploymentEnv(k8sclient *kubernetes.Clientset, deploymentName string,
 	})
 }
 
+// addOverrideLabels adds the override labels to specific the cert-manager operand. The update process
+// is retried if a conflict error is encountered.
+func addOverrideLabels(client *certmanoperatorclient.Clientset, deploymentName string, labels map[string]string) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		operator, err := client.OperatorV1alpha1().CertManagers().Get(context.TODO(), "cluster", metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		updatedOperator := operator.DeepCopy()
+
+		switch deploymentName {
+		case certmanagerControllerDeployment:
+			cfg := updatedOperator.Spec.ControllerConfig
+			if cfg == nil {
+				cfg = &v1alpha1.DeploymentConfig{}
+			}
+			cfg.OverrideLabels = labels
+			updatedOperator.Spec.ControllerConfig = cfg
+		case certmanagerWebhookDeployment:
+			cfg := updatedOperator.Spec.WebhookConfig
+			if cfg == nil {
+				cfg = &v1alpha1.DeploymentConfig{}
+			}
+			cfg.OverrideLabels = labels
+			updatedOperator.Spec.WebhookConfig = cfg
+		case certmanagerCAinjectorDeployment:
+			cfg := updatedOperator.Spec.CAInjectorConfig
+			if cfg == nil {
+				cfg = &v1alpha1.DeploymentConfig{}
+			}
+			cfg.OverrideLabels = labels
+			updatedOperator.Spec.CAInjectorConfig = cfg
+		default:
+			return fmt.Errorf("unsupported deployment name: %s", deploymentName)
+		}
+
+		_, err = client.OperatorV1alpha1().CertManagers().Update(context.TODO(), updatedOperator, metav1.UpdateOptions{})
+		return err
+	})
+}
+
 // addOverrideResources adds the override resources to the specific cert-manager operand. The update process
 // is retried if a conflict error is encountered.
 func addOverrideResources(client *certmanoperatorclient.Clientset, deploymentName string, res v1alpha1.CertManagerResourceRequirements) error {
@@ -644,6 +691,45 @@ func getCertManagerOperatorSubscription(ctx context.Context, loader library.Dyna
 	return subName, nil
 }
 
+// getSubscriptionEnvVar returns the value of an env var from the Subscription's spec.config.env,
+// or "" if the name is not present. valueFrom entries are treated as absent (empty string).
+func getSubscriptionEnvVar(ctx context.Context, loader library.DynamicResourceLoader, envName string) (string, error) {
+	subName, err := getCertManagerOperatorSubscription(ctx, loader)
+	if err != nil {
+		return "", err
+	}
+
+	subscriptionClient := loader.DynamicClient.Resource(subscriptionSchema).Namespace("cert-manager-operator")
+	sub, err := subscriptionClient.Get(ctx, subName, metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	config, ok := sub.Object["spec"].(map[string]interface{})["config"].(map[string]interface{})
+	if !ok {
+		return "", nil
+	}
+	envList, ok := config["env"].([]interface{})
+	if !ok {
+		return "", nil
+	}
+	for _, envItem := range envList {
+		envMap, ok := envItem.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		name, ok := envMap["name"].(string)
+		if !ok || name != envName {
+			continue
+		}
+		if v, ok := envMap["value"].(string); ok {
+			return v, nil
+		}
+		return "", nil
+	}
+	return "", nil
+}
+
 // patchSubscriptionWithEnvVars uses the k8s dynamic client to patch the only Subscription object
 // in the cert-manager-operator namespace, inject specified env vars into spec.config.env
 func patchSubscriptionWithEnvVars(ctx context.Context, loader library.DynamicResourceLoader, envVars map[string]string) error {
@@ -652,14 +738,51 @@ func patchSubscriptionWithEnvVars(ctx context.Context, loader library.DynamicRes
 		return err
 	}
 
-	env := make([]interface{}, len(envVars))
-	i := 0
-	for k, v := range envVars {
-		env[i] = map[string]interface{}{
-			"name":  k,
-			"value": v,
+	subscriptionClient := loader.DynamicClient.Resource(subscriptionSchema).Namespace("cert-manager-operator")
+
+	// Get current subscription to read existing env vars
+	sub, err := subscriptionClient.Get(ctx, subName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Preserve existing env items (including valueFrom entries)
+	existingEnvItems := make(map[string]interface{})
+	if config, ok := sub.Object["spec"].(map[string]interface{})["config"].(map[string]interface{}); ok {
+		if envList, ok := config["env"].([]interface{}); ok {
+			for _, envItem := range envList {
+				if envMap, ok := envItem.(map[string]interface{}); ok {
+					if name, ok := envMap["name"].(string); ok {
+						existingEnvItems[name] = envMap
+					}
+				}
+			}
 		}
-		i++
+	}
+
+	// Apply changes: add/update/delete only the specified env vars
+	// If a value is empty string, it means we want to remove that env var
+	for k, v := range envVars {
+		if v == "" {
+			delete(existingEnvItems, k)
+		} else {
+			existingEnvItems[k] = map[string]interface{}{
+				"name":  k,
+				"value": v,
+			}
+		}
+	}
+
+	// Convert back to array, sorted by name for deterministic output
+	keys := make([]string, 0, len(existingEnvItems))
+	for k := range existingEnvItems {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	env := make([]interface{}, 0, len(keys))
+	for _, k := range keys {
+		env = append(env, existingEnvItems[k])
 	}
 
 	patch := map[string]interface{}{
@@ -674,7 +797,6 @@ func patchSubscriptionWithEnvVars(ctx context.Context, loader library.DynamicRes
 		return err
 	}
 
-	subscriptionClient := loader.DynamicClient.Resource(subscriptionSchema).Namespace("cert-manager-operator")
 	_, err = subscriptionClient.Patch(ctx, subName, types.MergePatchType, payload, metav1.PatchOptions{})
 	return err
 }
@@ -739,6 +861,23 @@ func waitForDeploymentEnvVarAndRollout(ctx context.Context, namespace, deploymen
 	}, timeout)
 }
 
+// waitForDeploymentEnvVarRemovedAndRollout waits until no container sets envName to a non-empty
+// value and the rollout has completed. The variable may be absent from the pod template or present
+// with value "" — OLM/CSV often keeps the key with an empty string when Subscription spec.config.env
+// no longer defines that variable.
+func waitForDeploymentEnvVarRemovedAndRollout(ctx context.Context, namespace, deploymentName, envName string, timeout time.Duration) error {
+	return waitForDeploymentConditionAndRollout(ctx, namespace, deploymentName, func(deployment *appsv1.Deployment) bool {
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			for _, env := range container.Env {
+				if env.Name == envName && env.Value != "" {
+					return false
+				}
+			}
+		}
+		return true
+	}, timeout)
+}
+
 // waitForDeploymentArgAndRollout waits for a deployment to have a specific
 // argument in any container and for the rollout to complete. This is useful when
 // waiting for operator-driven changes to propagate to operand deployments,
@@ -753,6 +892,21 @@ func waitForDeploymentArgAndRollout(ctx context.Context, namespace, deploymentNa
 			}
 		}
 		return false
+	}, timeout)
+}
+
+// waitForDeploymentPodLabelAndRollout waits for a deployment's pod template to have
+// a specific label and for the rollout to complete. This is useful when waiting for
+// operator-driven label changes to propagate to operand deployments,
+// as it ensures the expected change has been applied before checking rollout status.
+func waitForDeploymentPodLabelAndRollout(ctx context.Context, namespace, deploymentName, labelKey, labelValue string, timeout time.Duration) error {
+	return waitForDeploymentConditionAndRollout(ctx, namespace, deploymentName, func(deployment *appsv1.Deployment) bool {
+		labels := deployment.Spec.Template.GetLabels()
+		if labels == nil {
+			return false
+		}
+		actual, ok := labels[labelKey]
+		return ok && actual == labelValue
 	}, timeout)
 }
 
@@ -862,6 +1016,40 @@ func verifyCertificateRenewed(ctx context.Context, secretName, namespace string,
 
 		// certificate was renewed atleast once
 		return true, nil
+	})
+}
+
+// createUniqueNamespace returns a DNS-1123-safe name for per-spec namespace isolation.
+func createUniqueNamespace(prefix string) string {
+	var b [4]byte
+	_, err := cryptorand.Read(b[:])
+	Expect(err).NotTo(HaveOccurred())
+	name := fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b[:]))
+	if len(name) > 63 {
+		return name[:63]
+	}
+	return name
+}
+
+// waitNamespaceDeleted polls until the namespace is gone.
+func waitNamespaceDeleted(ctx context.Context, clientset *kubernetes.Clientset, name string) {
+	Eventually(func() bool {
+		_, err := clientset.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
+		return apierrors.IsNotFound(err)
+	}, lowTimeout, fastPollInterval).Should(BeTrue())
+}
+
+// createAndDestroyTestNamespace creates a namespace with the given name and registers DeferCleanup
+// to delete it and wait until it is fully removed.
+func createAndDestroyTestNamespace(ctx context.Context, clientset *kubernetes.Clientset, name string) {
+	_, err := clientset.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+	}, metav1.CreateOptions{})
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(func() {
+		By("cleaning up test namespace")
+		_ = clientset.CoreV1().Namespaces().Delete(ctx, name, metav1.DeleteOptions{})
+		waitNamespaceDeleted(ctx, clientset, name)
 	})
 }
 
@@ -1195,6 +1383,10 @@ func resetCertManagerNetworkPolicyState(ctx context.Context, client *certmanoper
 							{
 								Protocol: ptr.To(corev1.ProtocolTCP),
 								Port:     ptr.To(intstr.FromInt32(3128)),
+							},
+							{
+								Protocol: ptr.To(corev1.ProtocolTCP),
+								Port:     ptr.To(intstr.FromInt32(3130)),
 							},
 						},
 					},

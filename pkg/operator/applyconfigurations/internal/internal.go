@@ -6,7 +6,7 @@ import (
 	fmt "fmt"
 	sync "sync"
 
-	typed "sigs.k8s.io/structured-merge-diff/v4/typed"
+	typed "sigs.k8s.io/structured-merge-diff/v6/typed"
 )
 
 func Parser() *typed.Parser {
@@ -34,6 +34,16 @@ var schemaYAML = typed.YAMLObject(`types:
       namedType: __untyped_deduced_
     elementRelationship: separable
 - name: com.github.openshift.cert-manager-operator.api.operator.v1alpha1.IstioCSR
+  scalar: untyped
+  list:
+    elementType:
+      namedType: __untyped_atomic_
+    elementRelationship: atomic
+  map:
+    elementType:
+      namedType: __untyped_deduced_
+    elementRelationship: separable
+- name: com.github.openshift.cert-manager-operator.api.operator.v1alpha1.TrustManager
   scalar: untyped
   list:
     elementType:

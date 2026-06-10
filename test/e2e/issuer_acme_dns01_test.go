@@ -5,23 +5,34 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/authorization/armauthorization/v2"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/msi/armmsi"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/resources/armresources"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/google/uuid"
 	gcpcrm "google.golang.org/api/cloudresourcemanager/v1"
 	gcpiam "google.golang.org/api/iam/v1"
 
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 
@@ -69,10 +80,6 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 		Expect(baseDomain).NotTo(BeEmpty(), "base domain should not be empty")
 		appsDomain = "apps." + baseDomain
 
-		By("waiting for operator status to become available")
-		err = VerifyHealthyOperatorConditions(certmanageroperatorclient.OperatorV1alpha1())
-		Expect(err).NotTo(HaveOccurred(), "Operator is expected to be available")
-
 		By("adding required args to cert-manager controller")
 		err = addOverrideArgs(certmanageroperatorclient, certmanagerControllerDeployment, []string{
 			// for Issuer to use ambient credentials
@@ -86,9 +93,48 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 		})
 		Expect(err).NotTo(HaveOccurred())
 
-		By("waiting for operator status to become available")
-		err = VerifyHealthyOperatorConditions(certmanageroperatorclient.OperatorV1alpha1())
-		Expect(err).NotTo(HaveOccurred(), "Operator is expected to be available")
+		proxy, err := configClient.Proxies().Get(ctx, "cluster", metav1.GetOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			Expect(err).NotTo(HaveOccurred(), "failed to get cluster proxy config")
+		}
+		if err == nil && proxy.Spec.TrustedCA.Name != "" {
+			By("creating trusted CA ConfigMap for HTTPS proxy")
+			trustedCA := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "trusted-ca",
+					Namespace: "cert-manager",
+					Labels: map[string]string{
+						"config.openshift.io/inject-trusted-cabundle": "true",
+					},
+				},
+			}
+			_, err = loader.KubeClient.CoreV1().ConfigMaps("cert-manager").Create(ctx, trustedCA, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred())
+
+			DeferCleanup(func(cleanupCtx context.Context) {
+				loader.KubeClient.CoreV1().ConfigMaps("cert-manager").Delete(cleanupCtx, "trusted-ca", metav1.DeleteOptions{})
+			})
+
+			By("setting trusted CA ConfigMap name via subscription env var")
+			err = patchSubscriptionWithEnvVars(ctx, loader, map[string]string{
+				"TRUSTED_CA_CONFIGMAP_NAME": "trusted-ca",
+			})
+			Expect(err).NotTo(HaveOccurred(), "failed to patch subscription with 'TRUSTED_CA_CONFIGMAP_NAME' environment variable")
+
+			DeferCleanup(func(cleanupCtx context.Context) {
+				By("removing 'TRUSTED_CA_CONFIGMAP_NAME' from subscription")
+				if err := patchSubscriptionWithEnvVars(cleanupCtx, loader, map[string]string{
+					"TRUSTED_CA_CONFIGMAP_NAME": "",
+				}); err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to remove env var from subscription during cleanup: %v\n", err)
+					return
+				}
+			})
+
+			By("waiting for operator deployment to restart with trusted CA configuration")
+			err = waitForDeploymentEnvVarAndRollout(ctx, operatorNamespace, operatorDeploymentName, "TRUSTED_CA_CONFIGMAP_NAME", "trusted-ca", lowTimeout)
+			Expect(err).NotTo(HaveOccurred())
+		}
 
 		DeferCleanup(func() {
 			By("resetting cert-manager state")
@@ -101,6 +147,10 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 		var err error
 		ctx, cancel = context.WithTimeout(context.Background(), highTimeout)
 		DeferCleanup(cancel)
+
+		By("waiting for operator status to become available")
+		err = VerifyHealthyOperatorConditions(certmanageroperatorclient.OperatorV1alpha1())
+		Expect(err).NotTo(HaveOccurred(), "Operator is expected to be available")
 
 		By("creating a test namespace")
 		ns, err = loader.CreateTestingNS("e2e-acme-dns01", false)
@@ -246,6 +296,16 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 			"CLOUD_CREDENTIALS_SECRET_NAME": "aws-creds",
 		})
 		Expect(err).NotTo(HaveOccurred(), "failed to patch subscription with env vars")
+
+		DeferCleanup(func(cleanupCtx context.Context) {
+			By("removing 'CLOUD_CREDENTIALS_SECRET_NAME' from subscription")
+			if err := patchSubscriptionWithEnvVars(cleanupCtx, loader, map[string]string{
+				"CLOUD_CREDENTIALS_SECRET_NAME": "",
+			}); err != nil {
+				fmt.Fprintf(GinkgoWriter, "failed to remove env var from subscription during cleanup: %v\n", err)
+				return
+			}
+		})
 	}
 
 	// getGCPProjectID retrieves GCP project ID from Infrastructure object
@@ -307,6 +367,16 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 			"CLOUD_CREDENTIALS_SECRET_NAME": "gcp-credentials",
 		})
 		Expect(err).NotTo(HaveOccurred(), "failed to patch subscription with env vars")
+
+		DeferCleanup(func(cleanupCtx context.Context) {
+			By("removing 'CLOUD_CREDENTIALS_SECRET_NAME' from subscription")
+			if err := patchSubscriptionWithEnvVars(cleanupCtx, loader, map[string]string{
+				"CLOUD_CREDENTIALS_SECRET_NAME": "",
+			}); err != nil {
+				fmt.Fprintf(GinkgoWriter, "failed to remove env var from subscription during cleanup: %v\n", err)
+				return
+			}
+		})
 	}
 
 	// removeGCPMemberFromPolicy removes a member from a role binding in a GCP IAM policy
@@ -371,6 +441,99 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 			log.Printf("IAM policy updated successfully")
 			return true, nil
 		})
+	}
+
+	// getAzureCredentials retrieves Azure Service Principal credentials from the kube-system namespace
+	getAzureCredentials := func(ctx context.Context) (clientID, clientSecret, tenantID []byte) {
+		By("obtaining Azure credentials from kube-system namespace")
+		azureCredsSecret, err := loader.KubeClient.CoreV1().Secrets("kube-system").Get(ctx, "azure-credentials", metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), "failed to get Azure credentials from kube-system")
+
+		clientID = azureCredsSecret.Data["azure_client_id"]
+		clientSecret = azureCredsSecret.Data["azure_client_secret"]
+		tenantID = azureCredsSecret.Data["azure_tenant_id"]
+
+		Expect(clientID).NotTo(BeEmpty(), "azure_client_id should not be empty")
+		Expect(clientSecret).NotTo(BeEmpty(), "azure_client_secret should not be empty")
+		Expect(tenantID).NotTo(BeEmpty(), "azure_tenant_id should not be empty")
+
+		return clientID, clientSecret, tenantID
+	}
+
+	// getAzureDNSZoneInfo extracts the subscription ID, resource group, and zone name
+	// from the OpenShift DNS config object's publicZone.ID, which is an Azure resource ID:
+	// /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/dnszones/<zone>
+	getAzureDNSZoneInfo := func(ctx context.Context) (subscriptionID, resourceGroupName, hostedZoneName string) {
+		By("getting Azure DNS zone info from DNS config object")
+		dns, err := configClient.DNSes().Get(ctx, "cluster", metav1.GetOptions{})
+		Expect(err).NotTo(HaveOccurred(), "failed to get DNS config object")
+		Expect(dns.Spec.PublicZone).NotTo(BeNil(), "DNS publicZone should not be nil")
+
+		zoneID := dns.Spec.PublicZone.ID
+		Expect(zoneID).NotTo(BeEmpty(), "DNS publicZone ID should not be empty")
+
+		parts := strings.Split(zoneID, "/")
+		// Expected: /subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.Network/dnszones/<zone>
+		Expect(len(parts)).To(BeNumerically(">=", 9), "unexpected Azure resource ID format: %s", zoneID)
+		Expect(parts[7]).To(Equal("dnszones"), "expected a DNS zone resource ID, got: %s", zoneID)
+		subscriptionID = parts[2]
+		resourceGroupName = parts[4]
+		hostedZoneName = parts[8]
+
+		Expect(subscriptionID).NotTo(BeEmpty(), "subscription ID should not be empty")
+		Expect(resourceGroupName).NotTo(BeEmpty(), "DNS zone resource group should not be empty")
+		Expect(hostedZoneName).NotTo(BeEmpty(), "hosted zone name should not be empty")
+
+		return subscriptionID, resourceGroupName, hostedZoneName
+	}
+
+	// setupCCOAzureCredentials creates a CredentialsRequest for Azure with fine-grained
+	// DNS Zone Contributor permissions and returns the CCO-provisioned credentials.
+	// Note: Unlike setupAmbientAWSCredentials/setupAmbientGCPCredentials, this does NOT patch
+	// the subscription with 'CLOUD_CREDENTIALS_SECRET_NAME' because the operator does not yet
+	// support mounting Azure credentials into the cert-manager pod. Once Azure support is added to
+	// 'withCloudCredentials' in credentials_request.go, it can be adapted to follow the AWS/GCP pattern.
+	setupCCOAzureCredentials := func(ctx context.Context) (clientID, clientSecret, tenantID []byte) {
+		By("creating CredentialsRequest object for Azure")
+		loader.CreateFromFile(testassets.ReadFile, filepath.Join("testdata", "credentials", "credentialsrequest_azure.yaml"), "")
+		DeferCleanup(func() {
+			loader.DeleteFromFile(testassets.ReadFile, filepath.Join("testdata", "credentials", "credentialsrequest_azure.yaml"), "")
+		})
+
+		By("waiting for cloud secret to be available")
+		var ccoSecret *corev1.Secret
+		err := wait.PollUntilContextTimeout(context.TODO(), slowPollInterval, highTimeout, true, func(context.Context) (bool, error) {
+			var getErr error
+			ccoSecret, getErr = loader.KubeClient.CoreV1().Secrets("cert-manager").Get(ctx, "azure-credentials", metav1.GetOptions{})
+			return getErr == nil, nil
+		})
+		Expect(err).NotTo(HaveOccurred(), "timeout waiting for Azure credentials secret")
+
+		By("reading CCO-provisioned credentials")
+		clientID = ccoSecret.Data["azure_client_id"]
+		clientSecret = ccoSecret.Data["azure_client_secret"]
+		tenantID = ccoSecret.Data["azure_tenant_id"]
+		Expect(clientID).NotTo(BeEmpty(), "azure_client_id should not be empty")
+		Expect(clientSecret).NotTo(BeEmpty(), "azure_client_secret should not be empty")
+		Expect(tenantID).NotTo(BeEmpty(), "azure_tenant_id should not be empty")
+
+		return clientID, clientSecret, tenantID
+	}
+
+	// copyAzureSecretToNamespace creates a secret in the test namespace with Azure client secret
+	copyAzureSecretToNamespace := func(ctx context.Context, namespace, secretName, secretKey string, clientSecret []byte) {
+		By(fmt.Sprintf("copying Azure client secret to namespace %s", namespace))
+		azureSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      secretName,
+				Namespace: namespace,
+			},
+			Data: map[string][]byte{
+				secretKey: clientSecret,
+			},
+		}
+		_, err := loader.KubeClient.CoreV1().Secrets(namespace).Create(ctx, azureSecret, metav1.CreateOptions{})
+		Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("failed to create secret %s", secretName))
 	}
 
 	Context("with AWS Route53", Label("Platform:AWS", "CredentialsMode:Mint"), func() {
@@ -477,7 +640,7 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 			createAndVerifyACMECertificate(ctx, certName, ns.Name, dnsName, issuerName, "Issuer")
 		})
 
-		It("should obtain a valid certificate when no hosted zone overlap", Label("TechPreview"), func() {
+		It("should obtain a valid certificate when no hosted zone overlap", func() {
 
 			// Get AWS credentials and region
 			accessKeyID, secretAccessKey := getAWSCredentials(ctx)
@@ -539,7 +702,7 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 			createAndVerifyACMECertificate(ctx, certName, ns.Name, dnsName, clusterIssuerName, "ClusterIssuer")
 		})
 
-		It("should obtain a valid certificate with DNS-over-HTTPS", Label("TechPreview"), func() {
+		It("should obtain a valid certificate with DNS-over-HTTPS", func() {
 
 			// Get AWS credentials and region
 			accessKeyID, secretAccessKey := getAWSCredentials(ctx)
@@ -587,7 +750,7 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 		})
 	})
 
-	Context("with AWS Route53 in STS environment", Label("Platform:AWS", "CredentialsMode:Manual"), Label("TechPreview"), func() {
+	Context("with AWS Route53 in STS environment", Label("Platform:AWS", "CredentialsMode:Manual"), func() {
 		var region string
 		var roleARN string
 
@@ -834,9 +997,11 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 
 			DeferCleanup(func(ctx context.Context) {
 				By("Removing 'CLOUD_CREDENTIALS_SECRET_NAME' from subscription")
-				err := patchSubscriptionWithEnvVars(ctx, loader, map[string]string{})
-				if err != nil {
+				if err := patchSubscriptionWithEnvVars(ctx, loader, map[string]string{
+					"CLOUD_CREDENTIALS_SECRET_NAME": "",
+				}); err != nil {
 					fmt.Fprintf(GinkgoWriter, "failed to remove env var from subscription during cleanup: %v\n", err)
+					return
 				}
 			})
 
@@ -947,7 +1112,7 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 		})
 	})
 
-	Context("with Google CloudDNS in Workload Identity environment", Label("Platform:GCP", "CredentialsMode:Manual"), Label("TechPreview"), func() {
+	Context("with Google CloudDNS in Workload Identity environment", Label("Platform:GCP", "CredentialsMode:Manual"), func() {
 
 		It("should obtain a valid certificate using ambient credentials", func() {
 
@@ -1097,9 +1262,11 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 
 			DeferCleanup(func(ctx context.Context) {
 				By("Removing 'CLOUD_CREDENTIALS_SECRET_NAME' from subscription")
-				err := patchSubscriptionWithEnvVars(ctx, loader, map[string]string{})
-				if err != nil {
+				if err := patchSubscriptionWithEnvVars(ctx, loader, map[string]string{
+					"CLOUD_CREDENTIALS_SECRET_NAME": "",
+				}); err != nil {
 					fmt.Fprintf(GinkgoWriter, "failed to remove env var from subscription during cleanup: %v\n", err)
+					return
 				}
 			})
 
@@ -1130,6 +1297,307 @@ var _ = Describe("ACME Issuer DNS01 solver", Ordered, func() {
 			// Create and verify certificate
 			certName := "cert-with-clouddns-workload-identity"
 			dnsName := fmt.Sprintf("adgcw-%s.%s", randomStr(3), appsDomain) // acronym for "ACME DNS01 Google CloudDNS Workload Identity"
+			createAndVerifyACMECertificate(ctx, certName, ns.Name, dnsName, clusterIssuerName, "ClusterIssuer")
+		})
+	})
+
+	Context("with Azure DNS", Label("Platform:Azure", "CredentialsMode:Mint"), func() {
+
+		It("should obtain a valid certificate using explicit credentials through Service Principal", func() {
+
+			// Get Azure Service Principal credentials (for authentication)
+			clientID, clientSecret, tenantID := getAzureCredentials(ctx)
+
+			// Get DNS zone subscription, resource group, and zone name from the DNS config object
+			subscriptionID, resourceGroupName, hostedZoneName := getAzureDNSZoneInfo(ctx)
+
+			// Copy client secret to test namespace
+			secretName := "azure-client-secret"
+			secretKey := "client-secret"
+			copyAzureSecretToNamespace(ctx, ns.Name, secretName, secretKey, clientSecret)
+
+			By("creating ACME Issuer with AzureDNS DNS-01 solver using explicit credentials")
+			issuerName := "letsencrypt-dns01"
+			solver := acmev1.ACMEChallengeSolver{
+				DNS01: &acmev1.ACMEChallengeSolverDNS01{
+					AzureDNS: &acmev1.ACMEIssuerDNS01ProviderAzureDNS{
+						SubscriptionID:    subscriptionID,
+						ResourceGroupName: resourceGroupName,
+						HostedZoneName:    hostedZoneName,
+						TenantID:          string(tenantID),
+						ClientID:          string(clientID),
+						ClientSecret: &certmanagermetav1.SecretKeySelector{
+							LocalObjectReference: certmanagermetav1.LocalObjectReference{
+								Name: secretName,
+							},
+							Key: secretKey,
+						},
+					},
+				},
+			}
+			issuer := createACMEIssuer(issuerName, solver)
+			_, err := certmanagerClient.CertmanagerV1().Issuers(ns.Name).Create(ctx, issuer, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to create Issuer")
+
+			By("waiting for Issuer to become ready")
+			err = waitForIssuerReadiness(ctx, issuerName, ns.Name)
+			Expect(err).NotTo(HaveOccurred(), "timeout waiting for Issuer to become Ready")
+
+			// Create and verify certificate
+			certName := "letsencrypt-cert"
+			dnsName := fmt.Sprintf("adaze-%s.%s", randomStr(3), appsDomain) // acronym for "ACME DNS01 AzureDNS Explicit"
+			createAndVerifyACMECertificate(ctx, certName, ns.Name, dnsName, issuerName, "Issuer")
+		})
+
+		It("should obtain a valid certificate using explicit credentials provisioned by CCO through Service Principal", func() {
+
+			// Setup CCO-provisioned credentials for Azure (fine-grained DNS Zone Contributor)
+			clientID, clientSecret, tenantID := setupCCOAzureCredentials(ctx)
+
+			// Get DNS zone subscription, resource group, and zone name from the DNS config object
+			subscriptionID, resourceGroupName, hostedZoneName := getAzureDNSZoneInfo(ctx)
+
+			// Copy client secret to test namespace for Issuer reference
+			secretName := "azure-client-secret"
+			secretKey := "client-secret"
+			copyAzureSecretToNamespace(ctx, ns.Name, secretName, secretKey, clientSecret)
+
+			By("creating ACME Issuer with AzureDNS DNS-01 solver using CCO-provisioned credentials")
+			issuerName := "letsencrypt-dns01-cco"
+			solver := acmev1.ACMEChallengeSolver{
+				DNS01: &acmev1.ACMEChallengeSolverDNS01{
+					AzureDNS: &acmev1.ACMEIssuerDNS01ProviderAzureDNS{
+						SubscriptionID:    subscriptionID,
+						ResourceGroupName: resourceGroupName,
+						HostedZoneName:    hostedZoneName,
+						TenantID:          string(tenantID),
+						ClientID:          string(clientID),
+						ClientSecret: &certmanagermetav1.SecretKeySelector{
+							LocalObjectReference: certmanagermetav1.LocalObjectReference{
+								Name: secretName,
+							},
+							Key: secretKey,
+						},
+					},
+				},
+			}
+			issuer := createACMEIssuer(issuerName, solver)
+			_, err := certmanagerClient.CertmanagerV1().Issuers(ns.Name).Create(ctx, issuer, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to create Issuer")
+
+			By("waiting for Issuer to become ready")
+			err = waitForIssuerReadiness(ctx, issuerName, ns.Name)
+			Expect(err).NotTo(HaveOccurred(), "timeout waiting for Issuer to become Ready")
+
+			// Create and verify certificate
+			certName := "letsencrypt-cert"
+			dnsName := fmt.Sprintf("adazc-%s.%s", randomStr(3), appsDomain) // acronym for "ACME DNS01 AzureDNS CCO"
+			createAndVerifyACMECertificate(ctx, certName, ns.Name, dnsName, issuerName, "Issuer")
+		})
+	})
+
+	Context("with Azure DNS in Workload Identity environment", Label("Platform:Azure", "CredentialsMode:Manual"), func() {
+		var identityClientID string
+		var subscriptionID, dnsResourceGroupName, hostedZoneName string
+
+		BeforeAll(func() {
+			By("verifying cluster is STS-enabled")
+			isSTS, err := isSTSCluster(ctx, oseOperatorClient, configClient)
+			Expect(err).NotTo(HaveOccurred())
+			if !isSTS {
+				Skip("Test requires Azure Workload Identity enabled")
+			}
+
+			By("setting up Azure authentication environment variable from credentials file")
+			if os.Getenv("OPENSHIFT_CI") == "true" {
+				clusterProfileDir := os.Getenv("CLUSTER_PROFILE_DIR")
+				Expect(clusterProfileDir).NotTo(BeEmpty(), "CLUSTER_PROFILE_DIR should exist when running in OpenShift CI")
+				os.Setenv("AZURE_AUTH_LOCATION", filepath.Join(clusterProfileDir, "osServicePrincipal.json"))
+			} else {
+				Expect(os.Getenv("AZURE_AUTH_LOCATION")).NotTo(BeEmpty(), "AZURE_AUTH_LOCATION must be set when running locally")
+			}
+			azureAuthLocation := os.Getenv("AZURE_AUTH_LOCATION")
+			data, err := os.ReadFile(azureAuthLocation)
+			Expect(err).NotTo(HaveOccurred(), "failed to read Azure credentials file")
+			var sp struct {
+				ClientID       string `json:"clientId"`
+				ClientSecret   string `json:"clientSecret"`
+				TenantID       string `json:"tenantId"`
+				SubscriptionID string `json:"subscriptionId"`
+			}
+			Expect(json.Unmarshal(data, &sp)).To(Succeed(), "failed to parse Azure credentials file")
+
+			By("creating Azure SDK credential")
+			cred, err := azidentity.NewClientSecretCredential(sp.TenantID, sp.ClientID, sp.ClientSecret, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create Azure SDK credential")
+
+			// The DNS zone may live in a different subscription than the cluster.
+			// Use the DNS zone subscription for DNS-related operations (issuer, role assignment scope),
+			// and the cluster subscription for infrastructure operations (RG lookup, MSI creation).
+			subscriptionID, dnsResourceGroupName, hostedZoneName = getAzureDNSZoneInfo(ctx)
+			clusterSubscriptionID := sp.SubscriptionID
+
+			By("getting cluster resource group from Infrastructure object")
+			infra, err := configClient.Infrastructures().Get(ctx, "cluster", metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get Infrastructure object")
+			clusterResourceGroup := infra.Status.PlatformStatus.Azure.ResourceGroupName
+			Expect(clusterResourceGroup).NotTo(BeEmpty(), "Azure resource group should not be empty")
+
+			By("getting cluster resource group location")
+			rgClient, err := armresources.NewResourceGroupsClient(clusterSubscriptionID, cred, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create resource groups client")
+			rg, err := rgClient.Get(ctx, clusterResourceGroup, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to get resource group")
+			Expect(rg.Location).NotTo(BeNil(), "resource group location should be populated")
+			location := *rg.Location
+
+			By("getting OIDC issuer from Authentication object")
+			authConfig, err := configClient.Authentications().Get(ctx, "cluster", metav1.GetOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to get Authentication object")
+			oidcIssuer := authConfig.Spec.ServiceAccountIssuer
+			Expect(oidcIssuer).NotTo(BeEmpty(), "OIDC issuer not found in Authentication object")
+
+			By("creating Azure Managed Identity")
+			randomSuffix := randomStr(4)
+			identityName := "e2e-cert-manager-dns01-" + randomSuffix
+			msiClient, err := armmsi.NewUserAssignedIdentitiesClient(clusterSubscriptionID, cred, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create MSI client")
+
+			identity, err := msiClient.CreateOrUpdate(ctx, clusterResourceGroup, identityName, armmsi.Identity{
+				Location: &location,
+			}, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create Managed Identity")
+			Expect(identity.Properties).NotTo(BeNil(), "managed identity properties should be populated")
+			Expect(identity.Properties.ClientID).NotTo(BeNil(), "managed identity client ID should be populated")
+			Expect(identity.Properties.PrincipalID).NotTo(BeNil(), "managed identity principal ID should be populated")
+			identityClientID = *identity.Properties.ClientID
+			identityPrincipalID := *identity.Properties.PrincipalID
+
+			DeferCleanup(func(ctx context.Context) {
+				By("Cleaning up Azure Managed Identity")
+				_, err := msiClient.Delete(ctx, clusterResourceGroup, identityName, nil)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete Managed Identity during cleanup: %v\n", err)
+				}
+			})
+
+			By("granting DNS Zone Contributor role to Managed Identity on the DNS zone")
+			dnsZoneScope := fmt.Sprintf("/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/dnszones/%s",
+				subscriptionID, dnsResourceGroupName, hostedZoneName)
+
+			roleDefClient, err := armauthorization.NewRoleDefinitionsClient(cred, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create role definitions client")
+			roleName := "DNS Zone Contributor"
+			filter := fmt.Sprintf("roleName eq '%s'", roleName)
+			pager := roleDefClient.NewListPager(dnsZoneScope, &armauthorization.RoleDefinitionsClientListOptions{Filter: &filter})
+			Expect(pager.More()).To(BeTrue(), "no role definitions found for %q", roleName)
+			page, err := pager.NextPage(ctx)
+			Expect(err).NotTo(HaveOccurred(), "failed to list role definitions")
+			Expect(page.Value).NotTo(BeEmpty(), "role definition %q not found", roleName)
+			dnsZoneContributorRoleID := *page.Value[0].ID
+
+			authClient, err := armauthorization.NewRoleAssignmentsClient(subscriptionID, cred, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create authorization client")
+			roleAssignmentName := uuid.New().String()
+
+			err = wait.PollUntilContextTimeout(ctx, fastPollInterval, lowTimeout, true, func(context.Context) (bool, error) {
+				_, assignErr := authClient.Create(ctx, dnsZoneScope, roleAssignmentName, armauthorization.RoleAssignmentCreateParameters{
+					Properties: &armauthorization.RoleAssignmentProperties{
+						RoleDefinitionID: &dnsZoneContributorRoleID,
+						PrincipalID:      &identityPrincipalID,
+						PrincipalType:    to.Ptr(armauthorization.PrincipalTypeServicePrincipal),
+					},
+				}, nil)
+				if assignErr != nil {
+					var respErr *azcore.ResponseError
+					if errors.As(assignErr, &respErr) &&
+						respErr.StatusCode == http.StatusConflict && respErr.ErrorCode == "RoleAssignmentExists" {
+						return true, nil
+					}
+					fmt.Fprintf(GinkgoWriter, "role assignment attempt failed (retrying): %v\n", assignErr)
+					return false, nil
+				}
+				return true, nil
+			})
+			Expect(err).NotTo(HaveOccurred(), "failed to create role assignment")
+
+			DeferCleanup(func(ctx context.Context) {
+				By("Cleaning up role assignment")
+				_, err := authClient.Delete(ctx, dnsZoneScope, roleAssignmentName, nil)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete role assignment during cleanup: %v\n", err)
+				}
+			})
+
+			By("creating Federated Identity Credential for cert-manager ServiceAccount")
+			ficClient, err := armmsi.NewFederatedIdentityCredentialsClient(clusterSubscriptionID, cred, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create Federated Identity Credentials client")
+
+			_, err = ficClient.CreateOrUpdate(ctx, clusterResourceGroup, identityName, "cert-manager", armmsi.FederatedIdentityCredential{
+				Properties: &armmsi.FederatedIdentityCredentialProperties{
+					Issuer:    &oidcIssuer,
+					Subject:   to.Ptr("system:serviceaccount:cert-manager:cert-manager"),
+					Audiences: []*string{to.Ptr("api://AzureADTokenExchange")},
+				},
+			}, nil)
+			Expect(err).NotTo(HaveOccurred(), "failed to create Federated Identity Credential")
+
+			DeferCleanup(func(ctx context.Context) {
+				By("Cleaning up Federated Identity Credential")
+				_, err := ficClient.Delete(ctx, clusterResourceGroup, identityName, "cert-manager", nil)
+				if err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to delete Federated Identity Credential during cleanup: %v\n", err)
+				}
+			})
+		})
+
+		It("should obtain a valid certificate using ambient credentials through AAD Workload Identity", func() {
+
+			By("adding 'azure.workload.identity/use' label to cert-manager controller pods")
+			err := addOverrideLabels(certmanageroperatorclient, certmanagerControllerDeployment, map[string]string{
+				"azure.workload.identity/use": "true",
+			})
+			Expect(err).NotTo(HaveOccurred(), "failed to add workload identity label to cert-manager controller")
+
+			DeferCleanup(func(ctx context.Context) {
+				By("Removing workload identity label from cert-manager controller pods")
+				if err := addOverrideLabels(certmanageroperatorclient, certmanagerControllerDeployment, nil); err != nil {
+					fmt.Fprintf(GinkgoWriter, "failed to remove workload identity label during cleanup: %v\n", err)
+				}
+			})
+
+			By("waiting for cert-manager deployment to rollout with workload identity label")
+			err = waitForDeploymentPodLabelAndRollout(ctx, "cert-manager", "cert-manager", "azure.workload.identity/use", "true", 2*time.Minute)
+			Expect(err).NotTo(HaveOccurred(), "timeout waiting for cert-manager deployment rollout with workload identity label")
+
+			By("creating ACME ClusterIssuer with AzureDNS DNS-01 solver using managed identity")
+			clusterIssuerName := "letsencrypt-dns01-azuredns-wi"
+			solver := acmev1.ACMEChallengeSolver{
+				DNS01: &acmev1.ACMEChallengeSolverDNS01{
+					AzureDNS: &acmev1.ACMEIssuerDNS01ProviderAzureDNS{
+						SubscriptionID:    subscriptionID,
+						ResourceGroupName: dnsResourceGroupName,
+						HostedZoneName:    hostedZoneName,
+						ManagedIdentity: &acmev1.AzureManagedIdentity{
+							ClientID: identityClientID,
+						},
+					},
+				},
+			}
+			clusterIssuer := createACMEClusterIssuer(clusterIssuerName, solver)
+			_, err = certmanagerClient.CertmanagerV1().ClusterIssuers().Create(ctx, clusterIssuer, metav1.CreateOptions{})
+			Expect(err).NotTo(HaveOccurred(), "failed to create ClusterIssuer")
+			DeferCleanup(func(ctx context.Context) {
+				certmanagerClient.CertmanagerV1().ClusterIssuers().Delete(ctx, clusterIssuerName, metav1.DeleteOptions{})
+			})
+
+			By("waiting for ClusterIssuer to become ready")
+			err = waitForClusterIssuerReadiness(ctx, clusterIssuerName)
+			Expect(err).NotTo(HaveOccurred(), "timeout waiting for ClusterIssuer to become Ready")
+
+			// Create and verify certificate
+			certName := "letsencrypt-cert-azuredns-wi"
+			dnsName := fmt.Sprintf("adazwi-%s.%s", randomStr(3), appsDomain) // acronym for "ACME DNS01 AzureDNS Workload Identity"
 			createAndVerifyACMECertificate(ctx, certName, ns.Name, dnsName, clusterIssuerName, "ClusterIssuer")
 		})
 	})

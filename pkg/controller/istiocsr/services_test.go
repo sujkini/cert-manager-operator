@@ -10,7 +10,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openshift/cert-manager-operator/api/operator/v1alpha1"
-	"github.com/openshift/cert-manager-operator/pkg/controller/istiocsr/fakes"
+	"github.com/openshift/cert-manager-operator/pkg/controller/common/fakes"
 )
 
 const (
@@ -45,7 +45,7 @@ func TestCreateOrApplyServices(t *testing.T) {
 				m.ExistsCalls(func(ctx context.Context, ns types.NamespacedName, obj client.Object) (bool, error) {
 					switch obj.(type) {
 					case *corev1.Service:
-						return false, testError
+						return false, errTestClient
 					}
 					return false, nil
 				})
@@ -58,7 +58,7 @@ func TestCreateOrApplyServices(t *testing.T) {
 				m.UpdateWithRetryCalls(func(ctx context.Context, obj client.Object, option ...client.UpdateOption) error {
 					switch obj.(type) {
 					case *corev1.Service:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -81,7 +81,7 @@ func TestCreateOrApplyServices(t *testing.T) {
 				m.CreateCalls(func(ctx context.Context, obj client.Object, opts ...client.CreateOption) error {
 					switch obj.(type) {
 					case *corev1.Service:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -106,7 +106,7 @@ func TestCreateOrApplyServices(t *testing.T) {
 			if tt.preReq != nil {
 				tt.preReq(r, mock)
 			}
-			r.ctrlClient = mock
+			r.CtrlClient = mock
 			istiocsr := testIstioCSR()
 			if tt.updateIstioCSR != nil {
 				tt.updateIstioCSR(istiocsr)

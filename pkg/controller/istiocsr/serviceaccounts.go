@@ -7,6 +7,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/openshift/cert-manager-operator/api/operator/v1alpha1"
+	"github.com/openshift/cert-manager-operator/pkg/controller/common"
 	"github.com/openshift/cert-manager-operator/pkg/operator/assets"
 )
 
@@ -18,32 +19,41 @@ func (r *Reconciler) createOrApplyServiceAccounts(istiocsr *v1alpha1.IstioCSR, r
 	fetched := &corev1.ServiceAccount{}
 	exist, err := r.Exists(r.ctx, client.ObjectKeyFromObject(desired), fetched)
 	if err != nil {
-		return FromClientError(err, "failed to check %s serviceaccount resource already exists", serviceAccountName)
+		return common.FromClientError(err, "failed to check %s serviceaccount resource already exists", serviceAccountName)
 	}
 
 	if exist {
 		if istioCSRCreateRecon {
 			r.eventRecorder.Eventf(istiocsr, corev1.EventTypeWarning, "ResourceAlreadyExists", "%s serviceaccount resource already exists, maybe from previous installation", serviceAccountName)
 		}
-		r.log.V(4).Info("serviceaccount resource already exists and is in expected state", "name", serviceAccountName)
+		if hasObjectChanged(desired, fetched) {
+			r.log.V(1).Info("serviceaccount has been modified, updating to desired state", "name", serviceAccountName)
+			if err := r.UpdateWithRetry(r.ctx, desired); err != nil {
+				return common.FromClientError(err, "failed to update %s serviceaccount resource", serviceAccountName)
+			}
+			r.eventRecorder.Eventf(istiocsr, corev1.EventTypeNormal, "Reconciled", "serviceaccount resource %s reconciled back to desired state", serviceAccountName)
+		} else {
+			r.log.V(4).Info("serviceaccount resource already exists and is in expected state", "name", serviceAccountName)
+		}
 	}
+
 	if !exist {
 		if err := r.Create(r.ctx, desired); err != nil {
-			return FromClientError(err, "failed to create %s serviceaccount resource", serviceAccountName)
+			return common.FromClientError(err, "failed to create %s serviceaccount resource", serviceAccountName)
 		}
 		r.eventRecorder.Eventf(istiocsr, corev1.EventTypeNormal, "Reconciled", "serviceaccount resource %s created", serviceAccountName)
 	}
 
 	if err := r.updateServiceAccountNameInStatus(istiocsr, desired); err != nil {
-		return FromClientError(err, "failed to update %s/%s istiocsr status with %s serviceaccount resource name", istiocsr.GetNamespace(), istiocsr.GetName(), serviceAccountName)
+		return common.FromClientError(err, "failed to update %s/%s istiocsr status with %s serviceaccount resource name", istiocsr.GetNamespace(), istiocsr.GetName(), serviceAccountName)
 	}
 	return nil
 }
 
 func (r *Reconciler) getServiceAccountObject(istiocsr *v1alpha1.IstioCSR, resourceLabels map[string]string) *corev1.ServiceAccount {
 	serviceAccount := decodeServiceAccountObjBytes(assets.MustAsset(serviceAccountAssetName))
-	updateNamespace(serviceAccount, istiocsr.GetNamespace())
-	updateResourceLabels(serviceAccount, resourceLabels)
+	common.UpdateNamespace(serviceAccount, istiocsr.GetNamespace())
+	common.UpdateResourceLabels(serviceAccount, resourceLabels)
 	return serviceAccount
 }
 

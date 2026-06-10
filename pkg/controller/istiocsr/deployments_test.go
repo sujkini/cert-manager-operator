@@ -20,7 +20,7 @@ import (
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 
 	"github.com/openshift/cert-manager-operator/api/operator/v1alpha1"
-	"github.com/openshift/cert-manager-operator/pkg/controller/istiocsr/fakes"
+	"github.com/openshift/cert-manager-operator/pkg/controller/common/fakes"
 )
 
 func TestCreateOrApplyDeployments(t *testing.T) {
@@ -116,7 +116,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 				m.CreateCalls(func(ctx context.Context, obj client.Object, _ ...client.CreateOption) error {
 					switch obj.(type) {
 					case *corev1.ConfigMap:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -167,7 +167,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 				m.ExistsCalls(func(ctx context.Context, ns types.NamespacedName, obj client.Object) (bool, error) {
 					switch o := obj.(type) {
 					case *appsv1.Deployment:
-						return false, testError
+						return false, errTestClient
 					case *corev1.ConfigMap:
 						configmap := testConfigMap()
 						configmap.DeepCopyInto(o)
@@ -217,7 +217,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 				m.UpdateWithRetryCalls(func(ctx context.Context, obj client.Object, _ ...client.UpdateOption) error {
 					switch obj.(type) {
 					case *appsv1.Deployment:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -360,12 +360,12 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 				m.StatusUpdateCalls(func(ctx context.Context, obj client.Object, _ ...client.SubResourceUpdateOption) error {
 					switch obj.(type) {
 					case *v1alpha1.IstioCSR:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
 			},
-			wantErr: `failed to update istiocsr-test-ns/istiocsr-test-resource istiocsr status with image info: failed to update istiocsr.openshift.operator.io "istiocsr-test-ns/istiocsr-test-resource" status: test client error`,
+			wantErr: `failed to update istiocsr-test-ns/istiocsr-test-resource istiocsr status with image info: failed to update status for "istiocsr-test-ns/istiocsr-test-resource": failed to update istiocsr.openshift.operator.io "istiocsr-test-ns/istiocsr-test-resource" status: test client error`,
 		},
 		{
 			name: "deployment reconciliation fails as invalid kind in issuerRef",
@@ -385,7 +385,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 			updateIstioCSR: func(i *v1alpha1.IstioCSR) {
 				i.Spec.IstioCSRConfig.CertManager.IssuerRef.Kind = "invalid"
 			},
-			wantErr: "failed to generate deployment resource for creation in istiocsr-test-ns: failed to verify issuer in istiocsr-test-ns/istiocsr-test-resource: spec.istioCSRConfig.certManager.issuerRef.kind can be anyof `clusterissuer` or `issuer`, configured: issuer: invalid issuerRef config",
+			wantErr: "failed to generate deployment resource for creation in istiocsr-test-ns: failed to verify issuer in istiocsr-test-ns/istiocsr-test-resource: spec.istioCSRConfig.certManager.issuerRef.kind can be any of `clusterissuer` or `issuer`, configured: invalid: invalid issuerRef config",
 		},
 		{
 			name: "deployment reconciliation fails as invalid group in issuerRef",
@@ -527,7 +527,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 						deployment := testDeployment()
 						deployment.DeepCopyInto(o)
 					case *corev1.ConfigMap:
-						return false, testError
+						return false, errTestClient
 					}
 					return true, nil
 				})
@@ -563,7 +563,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 				m.UpdateWithRetryCalls(func(ctx context.Context, obj client.Object, _ ...client.UpdateOption) error {
 					switch obj.(type) {
 					case *corev1.ConfigMap:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -785,7 +785,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 					},
 				}
 			},
-			wantErr: `failed to generate deployment resource for creation in istiocsr-test-ns: failed to update resource requirements: [spec.istioCSRConfig.resources.requests[test]: Invalid value: test: must be a standard resource type or fully qualified, spec.istioCSRConfig.resources.requests[test]: Invalid value: test: must be a standard resource for containers]`,
+			wantErr: `failed to generate deployment resource for creation in istiocsr-test-ns: failed to update resource requirements: [spec.istioCSRConfig.resources.requests[test]: Invalid value: "test": must be a standard resource type or fully qualified, spec.istioCSRConfig.resources.requests[test]: Invalid value: "test": must be a standard resource for containers]`,
 		},
 		{
 			name: "deployment reconciliation successful with CA certificate ConfigMap",
@@ -1071,7 +1071,7 @@ func TestCreateOrApplyDeployments(t *testing.T) {
 			if tt.preReq != nil {
 				tt.preReq(r, mock)
 			}
-			r.ctrlClient = mock
+			r.CtrlClient = mock
 			istiocsr := testIstioCSR()
 			if tt.updateIstioCSR != nil {
 				tt.updateIstioCSR(istiocsr)
@@ -1105,7 +1105,7 @@ func TestUpdateArgList(t *testing.T) {
 				// Server config is nil, so clusterID should default
 			},
 			expectedArgs: map[string]string{
-				"cluster-id": "Kubernetes",
+				"cluster-id": defaultClusterID,
 			},
 		},
 		{
@@ -1116,7 +1116,7 @@ func TestUpdateArgList(t *testing.T) {
 				}
 			},
 			expectedArgs: map[string]string{
-				"cluster-id": "Kubernetes",
+				"cluster-id": defaultClusterID,
 			},
 		},
 		{

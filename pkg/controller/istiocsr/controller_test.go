@@ -19,7 +19,7 @@ import (
 
 	certmanagerv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
 	"github.com/openshift/cert-manager-operator/api/operator/v1alpha1"
-	"github.com/openshift/cert-manager-operator/pkg/controller/istiocsr/fakes"
+	"github.com/openshift/cert-manager-operator/pkg/controller/common/fakes"
 )
 
 func TestReconcile(t *testing.T) {
@@ -144,7 +144,7 @@ func TestReconcile(t *testing.T) {
 					case *v1alpha1.IstioCSR:
 						// fail the operation where controller is trying to add processed annotation.
 						if _, exist := o.GetAnnotations()[controllerProcessedAnnotation]; exist {
-							return testError
+							return errTestClient
 						}
 					}
 					return nil
@@ -358,7 +358,7 @@ func TestReconcile(t *testing.T) {
 				},
 			},
 			requeue: false,
-			wantErr: `failed to update istiocsr-test-ns/istiocsr-test-resource status: failed to update istiocsr.openshift.operator.io "istiocsr-test-ns/istiocsr-test-resource" status: test error`,
+			wantErr: `failed to update istiocsr-test-ns/istiocsr-test-resource status: failed to update status for "istiocsr-test-ns/istiocsr-test-resource": failed to update istiocsr.openshift.operator.io "istiocsr-test-ns/istiocsr-test-resource" status: test error`,
 		},
 		{
 			name: "reconciliation remove finalizer from istiocsr fails",
@@ -376,7 +376,7 @@ func TestReconcile(t *testing.T) {
 				m.UpdateWithRetryCalls(func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 					switch obj.(type) {
 					case *v1alpha1.IstioCSR:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -398,7 +398,7 @@ func TestReconcile(t *testing.T) {
 				m.UpdateWithRetryCalls(func(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error {
 					switch obj.(type) {
 					case *v1alpha1.IstioCSR:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -415,7 +415,7 @@ func TestReconcile(t *testing.T) {
 			if tt.preReq != nil {
 				tt.preReq(r, mock)
 			}
-			r.ctrlClient = mock
+			r.CtrlClient = mock
 			istiocsr := testIstioCSR()
 			result, err := r.Reconcile(context.Background(),
 				ctrl.Request{
@@ -602,7 +602,7 @@ func TestProcessReconcileRequest(t *testing.T) {
 				m.ListCalls(func(ctx context.Context, list client.ObjectList, option ...client.ListOption) error {
 					switch list.(type) {
 					case *v1alpha1.IstioCSRList:
-						return testError
+						return errTestClient
 					}
 					return nil
 				})
@@ -679,7 +679,7 @@ func TestProcessReconcileRequest(t *testing.T) {
 					m.StatusUpdateCalls(func(ctx context.Context, obj client.Object, option ...client.SubResourceUpdateOption) error {
 						switch obj.(type) {
 						case *v1alpha1.IstioCSR:
-							return testError
+							return errTestClient
 						}
 						return nil
 					})
@@ -697,7 +697,7 @@ func TestProcessReconcileRequest(t *testing.T) {
 			expectedAnnotations: map[string]string{
 				controllerProcessingRejectedAnnotation: "true",
 			},
-			wantErr: `failed to update istiocsr3/istiocsr-test-resource status: failed to update istiocsr.openshift.operator.io "istiocsr3/istiocsr-test-resource" status: test client error`,
+			wantErr: `failed to update istiocsr3/istiocsr-test-resource status: failed to update status for "istiocsr3/istiocsr-test-resource": failed to update istiocsr.openshift.operator.io "istiocsr3/istiocsr-test-resource" status: test client error`,
 		},
 		{
 			name: "validating multiple istiocsrs' failed to update annotations",
@@ -728,7 +728,7 @@ func TestProcessReconcileRequest(t *testing.T) {
 					m.UpdateWithRetryCalls(func(ctx context.Context, obj client.Object, option ...client.UpdateOption) error {
 						switch obj.(type) {
 						case *v1alpha1.IstioCSR:
-							return testError
+							return errTestClient
 						}
 						return nil
 					})
@@ -757,7 +757,7 @@ func TestProcessReconcileRequest(t *testing.T) {
 			if tt.preReq != nil {
 				tt.preReq(r, mock)
 			}
-			r.ctrlClient = mock
+			r.CtrlClient = mock
 			istiocsr := tt.getIstioCSR()
 			_, err := r.processReconcileRequest(istiocsr,
 				types.NamespacedName{Name: istiocsr.GetName(), Namespace: istiocsr.GetNamespace()})

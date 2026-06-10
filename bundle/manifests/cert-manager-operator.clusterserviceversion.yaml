@@ -80,7 +80,7 @@ metadata:
             "issuerRef": {
               "group": "cert-manager.io",
               "kind": "ClusterIssuer",
-              "name": "selfsigned-issuer"
+              "name": "ca-cluster-issuer"
             },
             "privateKey": {
               "algorithm": "ECDSA",
@@ -139,10 +139,12 @@ metadata:
           "apiVersion": "cert-manager.io/v1",
           "kind": "ClusterIssuer",
           "metadata": {
-            "name": "selfsigned-issuer"
+            "name": "ca-cluster-issuer"
           },
           "spec": {
-            "selfSigned": {}
+            "ca": {
+              "secretName": "ca-root-secret"
+            }
           }
         },
         {
@@ -233,6 +235,42 @@ metadata:
               }
             }
           }
+        },
+        {
+          "apiVersion": "operator.openshift.io/v1alpha1",
+          "kind": "TrustManager",
+          "metadata": {
+            "name": "cluster"
+          },
+          "spec": {
+            "trustManagerConfig": {
+              "defaultCAPackage": {
+                "policy": "Enabled"
+              },
+              "logFormat": "text",
+              "logLevel": 1,
+              "trustNamespace": "cert-manager"
+            }
+          }
+        },
+        {
+          "apiVersion": "trust.cert-manager.io/v1alpha1",
+          "kind": "Bundle",
+          "metadata": {
+            "name": "example-bundle"
+          },
+          "spec": {
+            "sources": [
+              {
+                "useDefaultCAs": true
+              }
+            ],
+            "target": {
+              "configMap": {
+                "key": "ca-certificates.crt"
+              }
+            }
+          }
         }
       ]
     capabilities: Seamless Upgrades
@@ -250,7 +288,7 @@ metadata:
     features.operators.openshift.io/token-auth-aws: "true"
     features.operators.openshift.io/token-auth-azure: "true"
     features.operators.openshift.io/token-auth-gcp: "true"
-    olm.skipRange: '>=1.17.0 <1.18.0'
+    olm.skipRange: '>=1.18.0 <1.19.0'
     operator.openshift.io/uninstall-message: The cert-manager Operator for Red Hat
       OpenShift will be removed from cert-manager-operator namespace. If your Operator
       configured any off-cluster resources, these will continue to run and require
@@ -271,12 +309,18 @@ metadata:
     operatorframework.io/arch.ppc64le: supported
     operatorframework.io/arch.s390x: supported
     operatorframework.io/os.linux: supported
-  name: cert-manager-operator.v1.18.0
+  name: cert-manager-operator.v1.19.0
   namespace: cert-manager-operator
 spec:
   apiservicedefinitions: {}
   customresourcedefinitions:
     owned:
+    - description: A Bundle is used to distribute trust bundles across a Kubernetes
+        cluster.
+      displayName: Bundle
+      kind: Bundle
+      name: bundles.trust.cert-manager.io
+      version: v1alpha1
     - description: |-
         A CertificateRequest is used to request a signed certificate from one of the
         configured issuers.
@@ -344,8 +388,16 @@ spec:
       kind: Order
       name: orders.acme.cert-manager.io
       version: v1
+    - description: |-
+        TrustManager describes the configuration and information about the managed trust-manager deployment.
+        The name must be 'cluster' to make TrustManager a singleton, allowing only one instance per cluster.
+        When a TrustManager is created, trust-manager is deployed in the cert-manager namespace.
+      displayName: TrustManager
+      kind: TrustManager
+      name: trustmanagers.operator.openshift.io
+      version: v1alpha1
   description: |
-    The cert-manager Operator for Red Hat OpenShift provides seamless support for [cert-manager v1.18.3](https://github.com/cert-manager/cert-manager/tree/v1.18.3), which automates certificate management.
+    The cert-manager Operator for Red Hat OpenShift provides seamless support for [cert-manager v1.19.4](https://github.com/cert-manager/cert-manager/tree/v1.19.4), which automates certificate management.
     For more information, see the [cert-manager Operator for Red Hat OpenShift documentation](https://docs.openshift.com/container-platform/latest/security/cert_manager_operator/index.html).
   displayName: cert-manager Operator for Red Hat OpenShift
   icon:
@@ -355,6 +407,12 @@ spec:
     spec:
       clusterPermissions:
       - rules:
+        - apiGroups:
+          - config.openshift.io
+          resources:
+          - featuregates
+          verbs:
+          - get
         - apiGroups:
           - ""
           resources:
@@ -577,6 +635,7 @@ spec:
           resources:
           - certmanagers/finalizers
           - istiocsrs/finalizers
+          - trustmanagers/finalizers
           verbs:
           - update
         - apiGroups:
@@ -584,6 +643,7 @@ spec:
           resources:
           - certmanagers/status
           - istiocsrs/status
+          - trustmanagers/status
           verbs:
           - get
           - patch
@@ -592,6 +652,7 @@ spec:
           - operator.openshift.io
           resources:
           - istiocsrs
+          - trustmanagers
           verbs:
           - get
           - list
@@ -626,6 +687,26 @@ spec:
           - patch
           - update
           - watch
+        - apiGroups:
+          - trust.cert-manager.io
+          resources:
+          - bundles
+          verbs:
+          - get
+          - list
+          - watch
+        - apiGroups:
+          - trust.cert-manager.io
+          resources:
+          - bundles/finalizers
+          verbs:
+          - update
+        - apiGroups:
+          - trust.cert-manager.io
+          resources:
+          - bundles/status
+          verbs:
+          - patch
         - apiGroups:
           - authentication.k8s.io
           resources:
@@ -698,21 +779,25 @@ spec:
                 - name: OPERATOR_NAME
                   value: cert-manager-operator
                 - name: RELATED_IMAGE_CERT_MANAGER_WEBHOOK
-                  value: quay.io/jetstack/cert-manager-webhook:v1.18.3
+                  value: quay.io/jetstack/cert-manager-webhook:v1.19.4
                 - name: RELATED_IMAGE_CERT_MANAGER_CA_INJECTOR
-                  value: quay.io/jetstack/cert-manager-cainjector:v1.18.3
+                  value: quay.io/jetstack/cert-manager-cainjector:v1.19.4
                 - name: RELATED_IMAGE_CERT_MANAGER_CONTROLLER
-                  value: quay.io/jetstack/cert-manager-controller:v1.18.3
+                  value: quay.io/jetstack/cert-manager-controller:v1.19.4
                 - name: RELATED_IMAGE_CERT_MANAGER_ACMESOLVER
-                  value: quay.io/jetstack/cert-manager-acmesolver:v1.18.3
+                  value: quay.io/jetstack/cert-manager-acmesolver:v1.19.4
                 - name: RELATED_IMAGE_CERT_MANAGER_ISTIOCSR
-                  value: quay.io/jetstack/cert-manager-istio-csr:v0.14.2
+                  value: quay.io/jetstack/cert-manager-istio-csr:v0.16.0
+                - name: RELATED_IMAGE_CERT_MANAGER_TRUST_MANAGER
+                  value: quay.io/jetstack/trust-manager:v0.20.3
                 - name: OPERAND_IMAGE_VERSION
-                  value: 1.18.3
+                  value: 1.19.4
                 - name: ISTIOCSR_OPERAND_IMAGE_VERSION
-                  value: 0.14.2
+                  value: 0.16.0
+                - name: TRUSTMANAGER_OPERAND_IMAGE_VERSION
+                  value: 0.20.3
                 - name: OPERATOR_IMAGE_VERSION
-                  value: 1.18.0
+                  value: 1.19.0
                 - name: OPERATOR_LOG_LEVEL
                   value: "2"
                 - name: TRUSTED_CA_CONFIGMAP_NAME
@@ -803,6 +888,7 @@ spec:
   - security
   - TLS
   - istio-csr
+  - trust-manager
   links:
   - name: Documentation
     url: https://github.com/openshift/cert-manager-operator/blob/master/README.md
@@ -810,19 +896,21 @@ spec:
   - email: support@redhat.com
     name: Red Hat Support
   maturity: stable
-  minKubeVersion: 1.27.0
+  minKubeVersion: 1.31.0
   provider:
     name: Red Hat
   relatedImages:
-  - image: quay.io/jetstack/cert-manager-webhook:v1.18.3
+  - image: quay.io/jetstack/cert-manager-webhook:v1.19.4
     name: cert-manager-webhook
-  - image: quay.io/jetstack/cert-manager-cainjector:v1.18.3
+  - image: quay.io/jetstack/cert-manager-cainjector:v1.19.4
     name: cert-manager-ca-injector
-  - image: quay.io/jetstack/cert-manager-controller:v1.18.3
+  - image: quay.io/jetstack/cert-manager-controller:v1.19.4
     name: cert-manager-controller
-  - image: quay.io/jetstack/cert-manager-acmesolver:v1.18.3
+  - image: quay.io/jetstack/cert-manager-acmesolver:v1.19.4
     name: cert-manager-acmesolver
-  - image: quay.io/jetstack/cert-manager-istio-csr:v0.14.2
+  - image: quay.io/jetstack/cert-manager-istio-csr:v0.16.0
     name: cert-manager-istiocsr
-  replaces: cert-manager-operator.v1.17.0
-  version: 1.18.0
+  - image: quay.io/jetstack/trust-manager:v0.20.3
+    name: cert-manager-trust-manager
+  replaces: cert-manager-operator.v1.18.0
+  version: 1.19.0

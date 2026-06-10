@@ -2,17 +2,22 @@
 
 set -e
 
-source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
-source "$(dirname "${BASH_SOURCE}")/lib/yq.sh"
+# cleanup handled by trap
+cleanup() {
+  # cleanup created temp files
+  rm -f _output/manifest.yaml _output/manifest_as_array.json _output/targets_as_map.json
+}
+trap cleanup EXIT
 
-MANIFEST_SOURCE=${1:?"missing Cert Manager manifest url. You can use either http:// or file://"}
+source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
+
+CERT_MANAGER_VERSION=${1:?"missing cert-manager version. Please specify a version from https://github.com/cert-manager/cert-manager/releases"}
+MANIFEST_SOURCE="https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
 
 mkdir -p ./_output
 
 echo "---- Downloading manifest file from $MANIFEST_SOURCE ----"
 curl -NLs "$MANIFEST_SOURCE" -o ./_output/manifest.yaml
-
-go install ./vendor/github.com/google/go-jsonnet/cmd/jsonnet
 
 echo "---- Patching manifest ----"
 # Upstream manifest includes yaml items in a single file as separate yaml documents.
@@ -25,7 +30,7 @@ echo "---- Patching manifest ----"
 
 # Patch manifest using jsonnet.
 # This produces a map of patched target items having the filename as key and the patched item as value.
-jsonnet \
+./bin/jsonnet \
     --tla-code-file manifest=_output/manifest_as_array.json \
     jsonnet/main.jsonnet \
     | ./bin/yq e '.' - \
@@ -37,7 +42,7 @@ rm -rf bindata/cert-manager-deployment
 rm -rf config/crd/bases/*-crd.yaml
 
 # Split the produced target items in separate files and convert back to yaml.
-for file in $(./bin/yq eval 'keys | join(" ")' _output/targets_as_map.json)
+for file in $(./bin/yq eval --unwrapScalar 'keys | join(" ")' _output/targets_as_map.json)
 do
     dir=$(dirname "${file}")
     mkdir -p "${dir}"

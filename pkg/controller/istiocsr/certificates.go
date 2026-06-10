@@ -12,6 +12,7 @@ import (
 	certmanagermetav1 "github.com/cert-manager/cert-manager/pkg/apis/meta/v1"
 
 	"github.com/openshift/cert-manager-operator/api/operator/v1alpha1"
+	"github.com/openshift/cert-manager-operator/pkg/controller/common"
 	"github.com/openshift/cert-manager-operator/pkg/operator/assets"
 )
 
@@ -26,24 +27,27 @@ func (r *Reconciler) createOrApplyCertificates(istiocsr *v1alpha1.IstioCSR, reso
 	fetched := &certmanagerv1.Certificate{}
 	exist, err := r.Exists(r.ctx, client.ObjectKeyFromObject(desired), fetched)
 	if err != nil {
-		return FromClientError(err, "failed to check %s certificate resource already exists", certificateName)
+		return common.FromClientError(err, "failed to check %s certificate resource already exists", certificateName)
 	}
 
-	if exist && istioCSRCreateRecon {
-		r.eventRecorder.Eventf(istiocsr, corev1.EventTypeWarning, "ResourceAlreadyExists", "%s certificate resource already exists, maybe from previous installation", certificateName)
-	}
-	if exist && hasObjectChanged(desired, fetched) {
-		r.log.V(1).Info("certificate has been modified, updating to desired state", "name", certificateName)
-		if err := r.UpdateWithRetry(r.ctx, desired); err != nil {
-			return FromClientError(err, "failed to update %s certificate resource", certificateName)
+	if exist {
+		if istioCSRCreateRecon {
+			r.eventRecorder.Eventf(istiocsr, corev1.EventTypeWarning, "ResourceAlreadyExists", "%s certificate resource already exists, maybe from previous installation", certificateName)
 		}
-		r.eventRecorder.Eventf(istiocsr, corev1.EventTypeNormal, "Reconciled", "certificate resource %s reconciled back to desired state", certificateName)
-	} else {
-		r.log.V(4).Info("certificate resource already exists and is in expected state", "name", certificateName)
+		if hasObjectChanged(desired, fetched) {
+			r.log.V(1).Info("certificate has been modified, updating to desired state", "name", certificateName)
+			if err := r.UpdateWithRetry(r.ctx, desired); err != nil {
+				return common.FromClientError(err, "failed to update %s certificate resource", certificateName)
+			}
+			r.eventRecorder.Eventf(istiocsr, corev1.EventTypeNormal, "Reconciled", "certificate resource %s reconciled back to desired state", certificateName)
+		} else {
+			r.log.V(4).Info("certificate resource already exists and is in expected state", "name", certificateName)
+		}
 	}
+
 	if !exist {
 		if err := r.Create(r.ctx, desired); err != nil {
-			return FromClientError(err, "failed to create %s certificate resource", certificateName)
+			return common.FromClientError(err, "failed to create %s certificate resource", certificateName)
 		}
 		r.eventRecorder.Eventf(istiocsr, corev1.EventTypeNormal, "Reconciled", "certificate resource %s created", certificateName)
 	}
@@ -54,7 +58,7 @@ func (r *Reconciler) createOrApplyCertificates(istiocsr *v1alpha1.IstioCSR, reso
 func (r *Reconciler) getCertificateObject(istiocsr *v1alpha1.IstioCSR, resourceLabels map[string]string) (*certmanagerv1.Certificate, error) {
 	certificate := decodeCertificateObjBytes(assets.MustAsset(certificateAssetName))
 
-	updateNamespace(certificate, istiocsr.Spec.IstioCSRConfig.Istio.Namespace)
+	common.UpdateNamespace(certificate, istiocsr.Spec.IstioCSRConfig.Istio.Namespace)
 	// add custom label for identification on the object created in different namespace.
 	labels := make(map[string]string, len(resourceLabels)+1)
 	maps.Copy(labels, resourceLabels)
@@ -62,7 +66,7 @@ func (r *Reconciler) getCertificateObject(istiocsr *v1alpha1.IstioCSR, resourceL
 	certificate.SetLabels(labels)
 
 	if err := updateCertificateParams(istiocsr, certificate); err != nil {
-		return nil, NewIrrecoverableError(err, "failed to update certificate resource for %s/%s istiocsr deployment", istiocsr.GetNamespace(), istiocsr.GetName())
+		return nil, common.NewIrrecoverableError(err, "failed to update certificate resource for %s/%s istiocsr deployment", istiocsr.GetNamespace(), istiocsr.GetName())
 	}
 
 	return certificate, nil
@@ -74,8 +78,8 @@ func updateCertificateParams(istiocsr *v1alpha1.IstioCSR, certificate *certmanag
 		certificate.Spec.CommonName = fmt.Sprintf(istiodCertificateCommonNameFmt, istiocsr.Spec.IstioCSRConfig.Istio.Namespace)
 	}
 
-	dnsNames := make([]string, len(istiocsr.Spec.IstioCSRConfig.IstiodTLSConfig.CertificateDNSNames))
-	copy(dnsNames, istiocsr.Spec.IstioCSRConfig.IstiodTLSConfig.CertificateDNSNames)
+	dnsNames := make([]string, 0, len(istiocsr.Spec.IstioCSRConfig.IstiodTLSConfig.CertificateDNSNames)+len(istiocsr.Spec.IstioCSRConfig.Istio.Revisions))
+	dnsNames = append(dnsNames, istiocsr.Spec.IstioCSRConfig.IstiodTLSConfig.CertificateDNSNames...)
 
 	// Also need to add a DNS SAN for every requested revision, except for default revision, which will not be
 	// included in the DNS name.
@@ -83,8 +87,8 @@ func updateCertificateParams(istiocsr *v1alpha1.IstioCSR, certificate *certmanag
 		if revision == "" {
 			continue
 		}
-		if revision == "default" {
-			name := fmt.Sprintf(istiodCertificateDefaultDNSName, istiocsr.Spec.IstioCSRConfig.Istio.Namespace)
+		if revision == defaultIstioRevision {
+			name := fmt.Sprintf(istiodCertificateCommonNameFmt, istiocsr.Spec.IstioCSRConfig.Istio.Namespace)
 			dnsNames = append(dnsNames, name)
 			continue
 		}
@@ -126,7 +130,7 @@ func updateCertificateParams(istiocsr *v1alpha1.IstioCSR, certificate *certmanag
 		return fmt.Errorf("certificate parameters PrivateKeySize and PrivateKeyAlgorithm do not comply")
 	}
 
-	certificate.Spec.IssuerRef = certmanagermetav1.ObjectReference{
+	certificate.Spec.IssuerRef = certmanagermetav1.IssuerReference{
 		Kind:  istiocsr.Spec.IstioCSRConfig.CertManager.IssuerRef.Kind,
 		Group: istiocsr.Spec.IstioCSRConfig.CertManager.IssuerRef.Group,
 		Name:  istiocsr.Spec.IstioCSRConfig.CertManager.IssuerRef.Name,

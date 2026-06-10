@@ -2,8 +2,14 @@
 
 set -e
 
-source "$(dirname "${BASH_SOURCE}")/lib/init.sh"
-source "$(dirname "${BASH_SOURCE}")/lib/yq.sh"
+# cleanup handled by trap
+cleanup() {
+  # cleanup created temp files
+  rm -f _output/istio-csr-manifest.yaml
+}
+trap cleanup EXIT
+
+source "$(dirname "${BASH_SOURCE[0]}")/lib/init.sh"
 
 ISTIO_CSR_VERSION=${1:?"missing istio-csr version. Please specify a version from https://github.com/cert-manager/istio-csr/releases"}
 
@@ -36,8 +42,8 @@ mkdir -p bindata/istio-csr
     eval-all '.' -I 0 \
     _output/istio-csr-manifest.yaml | while read -r item; do
 
-  name=$(echo "$item" | ./bin/yq eval '.metadata.name' -)
-  kind=$(echo "$item" | ./bin/yq eval '.kind' - | tr '[:upper:]' '[:lower:]')
+  name=$(echo "$item" | ./bin/yq eval --unwrapScalar '.metadata.name' -)
+  kind=$(echo "$item" | ./bin/yq eval --unwrapScalar '.kind' - | tr '[:upper:]' '[:lower:]')
 
   # skip unused manifests
   if [[ "${name}-${kind}" == "cert-manager-istio-csr-dynamic-istiod-rolebinding" ]]; then
