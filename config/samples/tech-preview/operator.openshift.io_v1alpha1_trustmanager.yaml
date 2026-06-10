@@ -1,0 +1,9 @@
+apiVersion: operator.openshift.io/v1alpha1
+kind: TrustManager
+metadata:
+  name: cluster
+  annotations:
+    "kubernetes.io/description": "Resource behavior is managed through TrustManager featuregate, which is disabled by default and requires a Tech Preview OpenShift cluster. Please refer to the cert-manager documentation for more information on the trust-manager feature."
+spec:
+  managementState: Enabled
+  trustNamespace: cert-manager

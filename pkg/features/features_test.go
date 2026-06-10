@@ -23,7 +23,9 @@ var expectedDefaultFeatureState = map[bool][]featuregate.Feature{
 
 	// features DISABLED by default,
 	// list of features which are expected to be disabled at runtime.
-	false: {},
+	false: {
+		featuregate.Feature("TrustManager"),
+	},
 }
 
 func TestFeatureGates(t *testing.T) {
@@ -66,8 +68,9 @@ func TestFeatureGates(t *testing.T) {
 				continue
 			}
 
-			assert.Equal(t, spec.PreRelease == "TechPreview", !spec.Default,
-				"prerelease TechPreview %q feature should default to disabled",
+			isPreview := spec.PreRelease == featuregate.Beta || spec.PreRelease == featuregate.Alpha
+			assert.Equal(t, isPreview, !spec.Default,
+				"prerelease preview %q feature should default to disabled",
 				feat)
 		}
 	})

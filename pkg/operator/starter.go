@@ -140,15 +140,20 @@ func RunOperator(ctx context.Context, cc *controllercmd.ControllerContext) error
 		return fmt.Errorf("failed to parse addon features: %w", err)
 	}
 
-	// enable controller-runtime and istio-csr controller
-	// only when "IstioCSR" feature is turned on from --addon-features
-	if features.DefaultFeatureGate.Enabled(v1alpha1.FeatureIstioCSR) {
-		manager, err := NewControllerManager()
+	featureGateState := features.NewFeatureGateState(configClient)
+	enableIstioCSR := features.DefaultFeatureGate.Enabled(v1alpha1.FeatureIstioCSR)
+	enableTrustManager := featureGateState.IsTrustManagerFeatureGateEnabled(ctx)
+
+	if enableIstioCSR || enableTrustManager {
+		manager, err := NewControllerManager(ControllerManagerConfig{
+			EnableIstioCSR:     enableIstioCSR,
+			EnableTrustManager: enableTrustManager,
+		})
 		if err != nil {
 			return fmt.Errorf("failed to create controller manager: %w", err)
 		}
 		if err := manager.Start(ctrl.SetupSignalHandler()); err != nil {
-			return fmt.Errorf("failed to start istiocsr controller: %w", err)
+			return fmt.Errorf("failed to start addon controllers: %w", err)
 		}
 	}
 

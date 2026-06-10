@@ -6,6 +6,7 @@
 BUNDLE_VERSION ?= 1.18.0
 CERT_MANAGER_VERSION ?= "v1.18.3"
 ISTIO_CSR_VERSION ?= "v0.14.2"
+TRUST_MANAGER_VERSION ?= "v0.16.0"
 
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
@@ -147,6 +148,7 @@ test: manifests generate fmt vet ## Run tests.
 update-manifests: $(HELM_BIN)
 	hack/update-cert-manager-manifests.sh $(MANIFEST_SOURCE)
 	hack/update-istio-csr-manifests.sh $(ISTIO_CSR_VERSION)
+	hack/update-trust-manager-manifests.sh $(TRUST_MANAGER_VERSION)
 .PHONY: update-manifests
 
 .PHONY: update
@@ -180,6 +182,8 @@ local-run: build
 	RELATED_IMAGE_CERT_MANAGER_CONTROLLER=quay.io/jetstack/cert-manager-controller:$(CERT_MANAGER_VERSION) \
 	RELATED_IMAGE_CERT_MANAGER_ACMESOLVER=quay.io/jetstack/cert-manager-acmesolver:$(CERT_MANAGER_VERSION) \
 	RELATED_IMAGE_CERT_MANAGER_ISTIOCSR=quay.io/jetstack/cert-manager-istio-csr:$(ISTIO_CSR_VERSION) \
+	RELATED_IMAGE_CERT_MANAGER_TRUST_MANAGER=quay.io/jetstack/trust-manager:$(TRUST_MANAGER_VERSION) \
+	TRUST_MANAGER_OPERAND_IMAGE_VERSION=$(TRUST_MANAGER_VERSION) \
 	OPERATOR_NAME=cert-manager-operator \
 	OPERAND_IMAGE_VERSION=$(BUNDLE_VERSION) \
 	OPERATOR_IMAGE_VERSION=$(BUNDLE_VERSION) \
