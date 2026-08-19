@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -12,6 +13,7 @@ import (
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
+	"github.com/openshift/library-go/pkg/operator/resource/resourcemerge"
 	"github.com/openshift/library-go/pkg/operator/staticresourcecontroller"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
@@ -138,7 +140,9 @@ func (c *CertManagerNetworkPolicyUserDefinedController) sync(ctx context.Context
 		return fmt.Errorf("failed to reconcile user network policies: %w", err)
 	}
 
-	c.eventRecorder.Event("UserNetworkPolicyReconcileSuccess", "Successfully reconciled user-defined network policies")
+	// No success event is emitted on every sync: doing so produces continuous event
+	// spam even when nothing changed. Events are only fired when a resource is
+	// actually created or updated (see createOrUpdateNetworkPolicy).
 	return nil
 }
 
@@ -242,10 +246,21 @@ func (c *CertManagerNetworkPolicyUserDefinedController) createOrUpdateNetworkPol
 		return fmt.Errorf("failed to get existing network policy: %w", err)
 	}
 
-	// Update existing policy
-	existing.Spec = policy.Spec
-	existing.Labels = policy.Labels
-	_, err = c.kubeClient.NetworkingV1().NetworkPolicies(policy.Namespace).Update(ctx, existing, metav1.UpdateOptions{})
+	// Only update when the desired state actually differs from what already exists.
+	// Unconditionally updating on every sync bumps the resourceVersion, which
+	// re-triggers the controller's informer and causes an infinite
+	// reconcile/update loop that spams NetworkPolicyUpdated events (CM-763).
+	modified := false
+	existingCopy := existing.DeepCopy()
+	resourcemerge.EnsureObjectMeta(&modified, &existingCopy.ObjectMeta, policy.ObjectMeta)
+	specChanged := !equality.Semantic.DeepEqual(existingCopy.Spec, policy.Spec)
+	if !modified && !specChanged {
+		// Nothing changed; skip the no-op update to break the reconcile loop.
+		return nil
+	}
+
+	existingCopy.Spec = policy.Spec
+	_, err = c.kubeClient.NetworkingV1().NetworkPolicies(policy.Namespace).Update(ctx, existingCopy, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to update network policy: %w", err)
 	}
