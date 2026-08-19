@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -242,10 +243,21 @@ func (c *CertManagerNetworkPolicyUserDefinedController) createOrUpdateNetworkPol
 		return fmt.Errorf("failed to get existing network policy: %w", err)
 	}
 
-	// Update existing policy
-	existing.Spec = policy.Spec
-	existing.Labels = policy.Labels
-	_, err = c.kubeClient.NetworkingV1().NetworkPolicies(policy.Namespace).Update(ctx, existing, metav1.UpdateOptions{})
+	// Only update when the desired state actually differs from what already
+	// exists. Updating unconditionally on every sync rewrites the resource even
+	// when nothing changed, which bumps its resourceVersion, re-triggers the
+	// NetworkPolicy informer, and drives an endless reconciliation loop while
+	// emitting a spurious "NetworkPolicyUpdated" event on every cycle.
+	if networkPolicyEqual(existing, policy) {
+		return nil
+	}
+
+	// Update existing policy. Work on a copy so the object returned by Get (which
+	// may be backed by a shared cache) is not mutated in place.
+	updated := existing.DeepCopy()
+	updated.Spec = policy.Spec
+	updated.Labels = policy.Labels
+	_, err = c.kubeClient.NetworkingV1().NetworkPolicies(policy.Namespace).Update(ctx, updated, metav1.UpdateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to update network policy: %w", err)
 	}
@@ -253,4 +265,13 @@ func (c *CertManagerNetworkPolicyUserDefinedController) createOrUpdateNetworkPol
 	c.eventRecorder.Eventf("NetworkPolicyUpdated", "Updated user-defined network policy %s", policy.Name)
 
 	return nil
+}
+
+// networkPolicyEqual reports whether the existing NetworkPolicy already matches
+// the desired one for the fields this controller manages (the spec and the
+// owner labels). It is used to skip no-op updates that would otherwise trigger
+// unnecessary reconciliation loops.
+func networkPolicyEqual(existing, desired *networkingv1.NetworkPolicy) bool {
+	return equality.Semantic.DeepEqual(existing.Spec, desired.Spec) &&
+		equality.Semantic.DeepEqual(existing.Labels, desired.Labels)
 }
