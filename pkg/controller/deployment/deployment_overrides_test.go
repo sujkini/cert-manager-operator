@@ -1,17 +1,27 @@
 package deployment
 
 import (
+	"context"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/openshift/library-go/pkg/operator/resource/resourceread"
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
+	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/openshift/cert-manager-operator/api/operator/v1alpha1"
 	"github.com/openshift/cert-manager-operator/pkg/operator/assets"
+	"github.com/openshift/cert-manager-operator/pkg/operator/clientset/versioned/fake"
+	certmanoperatorinformer "github.com/openshift/cert-manager-operator/pkg/operator/informers/externalversions"
+	certmanagerinformer "github.com/openshift/cert-manager-operator/pkg/operator/informers/externalversions/operator/v1alpha1"
 )
 
 func TestUnsupportedConfigOverrides(t *testing.T) {
@@ -393,5 +403,109 @@ func TestParseArgMap(t *testing.T) {
 	parseArgMap(argMap, testArgs)
 	if !reflect.DeepEqual(argMap, wantMap) {
 		t.Fatalf("unexpected update to arg map, diff = %v", cmp.Diff(wantMap, argMap))
+	}
+}
+
+// newTestCertManagerInformer sets up a CertManager informer backed by a fake
+// clientset and returns the informer along with a function that creates a
+// CertManager object and blocks until the informer's cache observes it.
+func newTestCertManagerInformer(t *testing.T, ctx context.Context) (certmanagerinformer.CertManagerInformer, func(*v1alpha1.CertManager)) {
+	t.Helper()
+
+	watcherStarted := make(chan struct{})
+	fakeClient := fake.NewSimpleClientset()
+	fakeClient.PrependWatchReactor("certmanagers", func(action clienttesting.Action) (handled bool, ret watch.Interface, err error) {
+		gvr := action.GetResource()
+		ns := action.GetNamespace()
+		w, err := fakeClient.Tracker().Watch(gvr, ns)
+		if err != nil {
+			return false, nil, err
+		}
+		close(watcherStarted)
+		return true, w, nil
+	})
+
+	informer := certmanoperatorinformer.NewSharedInformerFactory(fakeClient, 0).Operator().V1alpha1().CertManagers()
+
+	certManagerChan := make(chan *v1alpha1.CertManager, 1)
+	informer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj any) {
+			certManagerChan <- obj.(*v1alpha1.CertManager)
+		},
+	})
+
+	go informer.Informer().Run(ctx.Done())
+	cache.WaitForCacheSync(ctx.Done(), informer.Informer().HasSynced)
+	<-watcherStarted
+
+	create := func(cm *v1alpha1.CertManager) {
+		t.Helper()
+		_, err := fakeClient.OperatorV1alpha1().CertManagers().Create(ctx, cm, metav1.CreateOptions{})
+		require.NoError(t, err)
+		select {
+		case <-certManagerChan:
+		case <-time.After(wait.ForeverTestTimeout):
+			t.Fatal("informer did not observe the created cert manager object")
+		}
+	}
+
+	return informer, create
+}
+
+// TestProxyEnvOverridePrecedence verifies that user-specified proxy values in
+// spec.controllerConfig.overrideEnv take precedence over the cluster-wide proxy
+// settings injected by withProxyEnv. This guards the hook ordering in
+// newGenericDeploymentController where withProxyEnv must run before
+// withContainerEnvOverrideHook so that the user override is applied last.
+func TestProxyEnvOverridePrecedence(t *testing.T) {
+	// Simulate cluster-wide proxy settings read from the operator environment.
+	t.Setenv("HTTP_PROXY", "http://cluster-proxy.example.com:3128")
+	t.Setenv("HTTPS_PROXY", "https://cluster-proxy.example.com:3128")
+	t.Setenv("NO_PROXY", "cluster-no-proxy")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	informer, create := newTestCertManagerInformer(t, ctx)
+
+	// User configures custom proxy values via overrideEnv.
+	userEnv := []corev1.EnvVar{
+		{Name: "HTTP_PROXY", Value: "http://custom-proxy.example.com:8080"},
+		{Name: "HTTPS_PROXY", Value: "https://custom-proxy.example.com:8080"},
+		{Name: "NO_PROXY", Value: "localhost,127.0.0.1"},
+	}
+	create(&v1alpha1.CertManager{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+		Spec: v1alpha1.CertManagerSpec{
+			ControllerConfig: &v1alpha1.DeploymentConfig{
+				OverrideEnv: userEnv,
+			},
+		},
+	})
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: certmanagerControllerDeployment},
+		Spec: appsv1.DeploymentSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{Name: certmanagerControllerDeployment}},
+				},
+			},
+		},
+	}
+
+	// Apply the hooks in the same order used by newGenericDeploymentController:
+	// cluster proxy first, user overrideEnv last so it wins.
+	require.NoError(t, withProxyEnv(nil, deployment))
+	require.NoError(t, withContainerEnvOverrideHook(informer, certmanagerControllerDeployment, getOverrideEnvFor)(nil, deployment))
+
+	got := map[string]string{}
+	for _, env := range deployment.Spec.Template.Spec.Containers[0].Env {
+		got[env.Name] = env.Value
+	}
+
+	for _, env := range userEnv {
+		require.Equalf(t, env.Value, got[env.Name],
+			"user-specified overrideEnv %q should take precedence over the cluster proxy value", env.Name)
 	}
 }
