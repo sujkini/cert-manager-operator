@@ -30,13 +30,14 @@ type ctrlClient interface {
 	Exists(context.Context, client.ObjectKey, client.Object) (bool, error)
 }
 
+// NewClient returns a ctrlClient backed by the manager's client. The manager's
+// client reads through the manager's cache (configured via CacheOptions), so the
+// reconciler and the controller's watches share a single cache. This avoids the
+// cache-sync race between two independent caches that caused IstioCSR create
+// events to be skipped as "not found" (CM-735).
 func NewClient(m manager.Manager) (ctrlClient, error) {
-	c, err := BuildCustomClient(m)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build custom client: %w", err)
-	}
 	return &ctrlClientImpl{
-		Client: c,
+		Client: m.GetClient(),
 	}, nil
 }
 

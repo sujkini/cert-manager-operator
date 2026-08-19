@@ -10,11 +10,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientscheme "k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/rest"
 	"k8s.io/klog/v2"
 
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
@@ -52,11 +50,14 @@ func NewControllerManager() (*Manager, error) {
 	setupLog.Info("setting up operator manager", "controller", istiocsr.ControllerName)
 	setupLog.Info("controller", "version", version.Get())
 
+	// Configure the manager's cache with the istiocsr controller's label
+	// selectors and use the manager's default (cache-backed) client. Sharing a
+	// single cache between the controller's watches and the reconciler's reads
+	// prevents the cache-sync race that intermittently left IstioCSR objects
+	// unreconciled with an empty status and no deployment (CM-735).
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
-		NewClient: func(config *rest.Config, options client.Options) (client.Client, error) {
-			return client.New(config, options)
-		},
+		Cache:  istiocsr.CacheOptions(),
 		Logger: ctrl.Log.WithName("operator-manager"),
 	})
 	if err != nil {

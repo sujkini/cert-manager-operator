@@ -71,14 +71,24 @@ func New(mgr ctrl.Manager) (*Reconciler, error) {
 	}, nil
 }
 
-func BuildCustomClient(mgr ctrl.Manager) (client.Client, error) {
+// CacheOptions returns the cache.Options used to configure the controller
+// manager's cache. Informers for the resources created and managed by the
+// controller are filtered by the controller's managed-by label so the cache
+// only tracks objects relevant to this operator.
+//
+// These options are applied to the manager's own cache (see setup_manager.go)
+// so that the controller's watches and the reconciler's reads share a single,
+// unified cache. A previous implementation used a separate cache for reads,
+// which could lag behind the manager cache that triggers reconcile events and
+// cause an IstioCSR create event to be observed before the read cache had the
+// object, resulting in the reconcile being skipped as "not found" (CM-735).
+// Only the type-specific label selectors are set here; the scheme, REST mapper
+// and HTTP client are populated by the manager.
+func CacheOptions() cache.Options {
 	managedResourceLabelReq, _ := labels.NewRequirement(requestEnqueueLabelKey, selection.Equals, []string{requestEnqueueLabelValue})
 	managedResourceLabelReqSelector := labels.NewSelector().Add(*managedResourceLabelReq)
 
-	customCacheOpts := cache.Options{
-		HTTPClient: mgr.GetHTTPClient(),
-		Scheme:     mgr.GetScheme(),
-		Mapper:     mgr.GetRESTMapper(),
+	return cache.Options{
 		ByObject: map[client.Object]cache.ByObject{
 			&certmanagerv1.Certificate{}: {
 				Label: managedResourceLabelReqSelector,
@@ -105,70 +115,7 @@ func BuildCustomClient(mgr ctrl.Manager) (client.Client, error) {
 				Label: managedResourceLabelReqSelector,
 			},
 		},
-		ReaderFailOnMissingInformer: true,
 	}
-	customCache, err := cache.New(mgr.GetConfig(), customCacheOpts)
-	if err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &v1alpha1.IstioCSR{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &certmanagerv1.Certificate{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &appsv1.Deployment{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &rbacv1.ClusterRole{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &rbacv1.ClusterRoleBinding{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &rbacv1.Role{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &rbacv1.RoleBinding{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &corev1.Service{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &corev1.ServiceAccount{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &corev1.Secret{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &corev1.ConfigMap{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &certmanagerv1.Issuer{}); err != nil {
-		return nil, err
-	}
-	if _, err = customCache.GetInformer(context.Background(), &certmanagerv1.ClusterIssuer{}); err != nil {
-		return nil, err
-	}
-
-	err = mgr.Add(customCache)
-	if err != nil {
-		return nil, err
-	}
-
-	customClient, err := client.New(mgr.GetConfig(), client.Options{
-		HTTPClient: mgr.GetHTTPClient(),
-		Scheme:     mgr.GetScheme(),
-		Mapper:     mgr.GetRESTMapper(),
-		Cache: &client.CacheOptions{
-			Reader: customCache,
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return customClient, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
