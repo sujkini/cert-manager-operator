@@ -38,6 +38,10 @@ func newGenericDeploymentController(
 		withPodLabelsValidateHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name),
 		withContainerArgsOverrideHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name, getOverrideArgsFor),
 		withContainerArgsValidateHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name),
+		// withProxyEnv must run before withContainerEnvOverrideHook so that
+		// user-specified overrideEnv values (applied last) take precedence over
+		// the cluster-wide proxy settings injected here.
+		withProxyEnv,
 		withContainerEnvOverrideHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name, getOverrideEnvFor),
 		withContainerEnvValidateHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name),
 		withDeploymentReplicasOverrideHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name, getOverrideReplicasFor),
@@ -46,7 +50,6 @@ func newGenericDeploymentController(
 		withPodSchedulingOverrideHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name, getOverrideSchedulingFor),
 		withPodSchedulingValidateHook(certManagerOperatorInformers.Operator().V1alpha1().CertManagers(), deployment.Name),
 		withUnsupportedArgsOverrideHook,
-		withProxyEnv,
 		withCAConfigMap(kubeInformersForTargetNamespace.Core().V1().ConfigMaps(), deployment, trustedCAConfigmapName),
 		withSABoundToken,
 	}
